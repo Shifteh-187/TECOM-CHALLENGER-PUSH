@@ -1,0 +1,59 @@
+# config.yaml
+
+server:
+  listen_host: "0.0.0.0"
+  listen_port: 5000
+  poll_interval_seconds: 5
+  base_dir: "/var/lib/tecom-listener"
+
+pushover:
+  enabled: true
+  user_key: "PUT_YOUR_PUSHOVER_USER_KEY_HERE"
+  api_token: "PUT_YOUR_PUSHOVER_APP_TOKEN_HERE"
+  default_priority: 0
+
+# Map zones to friendly names
+zones:
+  "001": "Front Door PIR"
+  "002": "Lounge PIR"
+  "003": "Gun Safe PIR"
+
+# Map inputs to friendly names
+inputs:
+  "005": "Safe Reed Switch"
+  "006": "Garage Roller Door"
+
+# Notification rules
+# First matching rule wins.
+notifications:
+  # Example: high-priority on gun safe alarm
+  - name: "Gun safe alarm"
+    match_regex: "ZONE\\s+003.*ALARM"
+    send_pushover: true
+    priority: 1
+    title: "GUN SAFE ALARM"
+    message: "Gun safe zone ({zone_number} - {zone_name}) is IN ALARM.\nRaw: {raw}"
+
+  # Example: any alarm on any zone
+  - name: "General zone alarm"
+    match_regex: "ZONE\\s+(\\d+).*ALARM"
+    send_pushover: true
+    priority: 0
+    title: "Alarm on Zone {zone_number} - {zone_name}"
+    message: "Zone {zone_number} ({zone_name}) reported ALARM.\nEvent: {raw}"
+
+  # Example: input open/restore
+  - name: "Input event"
+    match_regex: "INPUT\\s+(\\d+)"
+    send_pushover: true
+    priority: 0
+    title: "Input {input_number} - {input_name}"
+    message: "Input {input_number} ({input_name}) changed state.\nEvent: {raw}"
+
+  # Fallback default – catch anything else
+  - name: "Default"
+    match_regex: ".*"
+    send_pushover: true
+    priority: 0
+    title: "Challenger Event"
+    message: "{raw}"
