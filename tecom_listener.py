@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
-Tecom / Challenger TCP listener with Pushover notifications and
-configurable rules (YAML).
+Tecom / Challenger TCP listener with multi-backend notifications:
+- Pushover
+- MQTT
+- Telegram
+- Home Assistant (REST events)
 
-- Listens for Computer Event Driven / Printer format on TCP.
-- Stores all events in events.log.
-- Queues new events in events_queue.txt.
-- Background thread processes queue:
-    * applies notification rules
-    * sends to Pushover (if enabled)
-    * removes successfully sent items from queue
-
-Config: see config.yaml
+Uses a YAML config file (config.yaml) for all settings and rules.
 """
 
 import os
@@ -19,9 +14,12 @@ import time
 import socket
 import threading
 import re
+import json
+from typing import Dict, Any, List
+
 import requests
 import yaml
-from typing import Dict, Any, List, Tuple
+import paho.mqtt.client as mqtt
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
 
@@ -32,20 +30,44 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
 
 def load_config(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
 
-    # Basic sanity defaults
+    # Server
     cfg.setdefault("server", {})
     cfg["server"].setdefault("listen_host", "0.0.0.0")
     cfg["server"].setdefault("listen_port", 5000)
     cfg["server"].setdefault("poll_interval_seconds", 5)
     cfg["server"].setdefault("base_dir", "/var/lib/tecom-listener")
 
+    # Pushover
     cfg.setdefault("pushover", {})
     cfg["pushover"].setdefault("enabled", False)
     cfg["pushover"].setdefault("user_key", "")
     cfg["pushover"].setdefault("api_token", "")
     cfg["pushover"].setdefault("default_priority", 0)
+
+    # MQTT
+    cfg.setdefault("mqtt", {})
+    cfg["mqtt"].setdefault("enabled", False)
+    cfg["mqtt"].setdefault("host", "localhost")
+    cfg["mqtt"].setdefault("port", 1883)
+    cfg["mqtt"].setdefault("username", "")
+    cfg["mqtt"].setdefault("password", "")
+    cfg["mqtt"].setdefault("client_id", "tecom-listener")
+    cfg["mqtt"].setdefault("topic", "tecom/events")
+
+    # Telegram
+    cfg.setdefault("telegram", {})
+    cfg["telegram"].setdefault("enabled", False)
+    cfg["telegram"].setdefault("bot_token", "")
+    cfg["telegram"].setdefault("chat_id", "")
+
+    # Home Assistant
+    cfg.setdefault("homeassistant", {})
+    cfg["homeassistant"].setdefault("enabled", False)
+    cfg["homeassistant"].setdefault("base_url", "http://homeassistant.local:8123")
+    cfg["homeassistant"].setdefault("long_lived_token", "")
+    cfg["homeassistant"].setdefault("event_name", "tecom_event")
 
     cfg.setdefault("zones", {})
     cfg.setdefault("inputs", {})
@@ -67,19 +89,44 @@ POLL_INTERVAL_SECONDS = int(config["server"]["poll_interval_seconds"])
 ZONES: Dict[str, str] = config.get("zones", {})
 INPUTS: Dict[str, str] = config.get("inputs", {})
 
+# Pushover
 PUSHOVER_ENABLED = bool(config["pushover"]["enabled"])
 PUSHOVER_USER_KEY = config["pushover"]["user_key"]
 PUSHOVER_API_TOKEN = config["pushover"]["api_token"]
 PUSHOVER_DEFAULT_PRIORITY = int(config["pushover"]["default_priority"])
+
+# MQTT
+MQTT_ENABLED = bool(config["mqtt"]["enabled"])
+MQTT_HOST = config["mqtt"]["host"]
+MQTT_PORT = int(config["mqtt"]["port"])
+MQTT_USERNAME = config["mqtt"]["username"]
+MQTT_PASSWORD = config["mqtt"]["password"]
+MQTT_CLIENT_ID = config["mqtt"]["client_id"]
+MQTT_TOPIC_DEFAULT = config["mqtt"]["topic"]
+
+# Telegram
+TELEGRAM_ENABLED = bool(config["telegram"]["enabled"])
+TELEGRAM_BOT_TOKEN = config["telegram"]["bot_token"]
+TELEGRAM_CHAT_ID = str(config["telegram"]["chat_id"])
+
+# Home Assistant
+HA_ENABLED = bool(config["homeassistant"]["enabled"])
+HA_BASE_URL = config["homeassistant"]["base_url"].rstrip("/")
+HA_TOKEN = config["homeassistant"]["long_lived_token"]
+HA_EVENT_DEFAULT = config["homeassistant"]["event_name"]
 
 NOTIFICATION_RULES: List[Dict[str, Any]] = config.get("notifications", [])
 
 os.makedirs(BASE_DIR, exist_ok=True)
 file_lock = threading.Lock()
 
+# MQTT client globals
+mqtt_client = None
+mqtt_connected = False
+
 
 # ==========================
-# LOGGING & QUEUE
+# UTIL / LOGGING
 # ==========================
 
 def now_ts() -> str:
@@ -101,7 +148,7 @@ def queue_event(raw_event: str) -> None:
 
 
 # ==========================
-# PARSING & RULE ENGINE
+# PARSING & RULES
 # ==========================
 
 ZONE_RE = re.compile(r"ZONE\s+(\d+)")
@@ -137,41 +184,38 @@ def extract_context(raw_line: str) -> Dict[str, Any]:
 
 def render_template(template: str, ctx: Dict[str, Any]) -> str:
     """
-    Safe-ish template render. Unknown keys become empty.
+    Safe-ish formatter: if a key is missing, just return the template unchanged.
     """
     try:
         return template.format(**ctx)
-    except KeyError:
-        # If someone references a missing key, avoid crashing.
+    except Exception:
         return template
 
 
-def choose_notification(raw_line: str) -> Tuple[bool, int, str, str]:
+def get_matching_rule(raw_line: str) -> Dict[str, Any]:
     """
-    Apply notification rules from config.
-
-    Returns: (send_pushover, priority, title, message)
+    Return the first rule whose regex matches, or a built-in default rule.
     """
-    ctx = extract_context(raw_line)
-
     for rule in NOTIFICATION_RULES:
         pattern = rule.get("match_regex", ".*")
-        if not re.search(pattern, raw_line):
+        try:
+            if re.search(pattern, raw_line):
+                return rule
+        except re.error as e:
+            log(f"Invalid regex in rule '{rule.get('name','unnamed')}': {e}")
             continue
 
-        send_p = bool(rule.get("send_pushover", True))
-        priority = int(rule.get("priority", PUSHOVER_DEFAULT_PRIORITY))
-
-        title_t = rule.get("title", "Challenger Event")
-        msg_t = rule.get("message", "{raw}")
-
-        title = render_template(title_t, ctx)
-        message = render_template(msg_t, ctx)
-
-        return send_p, priority, title, message
-
-    # If no rules at all
-    return True, PUSHOVER_DEFAULT_PRIORITY, "Challenger Event", raw_line
+    # default rule if nothing matched
+    return {
+        "name": "Default",
+        "match_regex": ".*",
+        "send_pushover": True,
+        "send_mqtt": True,
+        "send_telegram": True,
+        "send_homeassistant": True,
+        "title": "Challenger Event",
+        "message": "{raw}",
+    }
 
 
 # ==========================
@@ -180,11 +224,10 @@ def choose_notification(raw_line: str) -> Tuple[bool, int, str, str]:
 
 def send_pushover(title: str, message: str, priority: int = 0) -> bool:
     if not PUSHOVER_ENABLED:
-        log(f"Pushover disabled, not sending: {title} | {message}")
-        return True  # treat as success so queue doesn't grow forever
+        return True  # treated as success if backend disabled
 
     if not PUSHOVER_USER_KEY or not PUSHOVER_API_TOKEN:
-        log("Pushover keys not configured, skipping send.")
+        log("Pushover enabled but user_key or api_token not configured.")
         return False
 
     try:
@@ -209,11 +252,146 @@ def send_pushover(title: str, message: str, priority: int = 0) -> bool:
 
 
 # ==========================
+# MQTT
+# ==========================
+
+def ensure_mqtt_connected():
+    """
+    Lazily create and connect the MQTT client.
+    """
+    global mqtt_client, mqtt_connected
+
+    if not MQTT_ENABLED:
+        return
+
+    if mqtt_client is None:
+        mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID or "", clean_session=True)
+        if MQTT_USERNAME:
+            mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD or None)
+
+    if not mqtt_connected:
+        try:
+            mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+            mqtt_client.loop_start()
+            mqtt_connected = True
+            log(f"Connected to MQTT broker at {MQTT_HOST}:{MQTT_PORT}")
+        except Exception as e:
+            mqtt_connected = False
+            log(f"MQTT connect failed: {e}")
+
+
+def send_mqtt(ctx: Dict[str, Any], title: str, message: str, rule: Dict[str, Any]) -> bool:
+    if not MQTT_ENABLED:
+        return True
+
+    ensure_mqtt_connected()
+    if not mqtt_connected:
+        return False
+
+    topic_t = rule.get("mqtt_topic", MQTT_TOPIC_DEFAULT)
+    topic = render_template(topic_t, ctx)
+
+    payload = {
+        "title": title,
+        "message": message,
+        "zone_number": ctx.get("zone_number"),
+        "zone_name": ctx.get("zone_name"),
+        "input_number": ctx.get("input_number"),
+        "input_name": ctx.get("input_name"),
+        "rule": rule.get("name", "Unnamed"),
+        "timestamp": now_ts(),
+    }
+
+    try:
+        res = mqtt_client.publish(topic, json.dumps(payload), qos=0, retain=False)
+        if res.rc == mqtt.MQTT_ERR_SUCCESS:
+            return True
+        log(f"MQTT publish error rc={res.rc}")
+        return False
+    except Exception as e:
+        log(f"MQTT publish exception: {e}")
+        return False
+
+
+# ==========================
+# TELEGRAM
+# ==========================
+
+def send_telegram(title: str, message: str) -> bool:
+    if not TELEGRAM_ENABLED:
+        return True
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram enabled but bot_token or chat_id not set.")
+        return False
+
+    try:
+        text = f"{title}\n{message}"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4096]},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return True
+        log(f"Telegram error {resp.status_code}: {resp.text}")
+        return False
+    except Exception as e:
+        log(f"Telegram exception: {e}")
+        return False
+
+
+# ==========================
+# HOME ASSISTANT
+# ==========================
+
+def send_homeassistant(ctx: Dict[str, Any], title: str, message: str, rule: Dict[str, Any]) -> bool:
+    if not HA_ENABLED:
+        return True
+
+    if not HA_TOKEN or not HA_BASE_URL:
+        log("Home Assistant enabled but base_url or long_lived_token not set.")
+        return False
+
+    event_name_t = rule.get("ha_event", HA_EVENT_DEFAULT)
+    event_name = render_template(event_name_t, ctx)
+    url = f"{HA_BASE_URL}/api/events/{event_name}"
+
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "title": title,
+        "message": message,
+        "zone_number": ctx.get("zone_number"),
+        "zone_name": ctx.get("zone_name"),
+        "input_number": ctx.get("input_number"),
+        "input_name": ctx.get("input_name"),
+        "rule": rule.get("name", "Unnamed"),
+        "timestamp": now_ts(),
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        if resp.status_code in (200, 201):
+            return True
+        log(f"Home Assistant error {resp.status_code}: {resp.text}")
+        return False
+    except Exception as e:
+        log(f"Home Assistant exception: {e}")
+        return False
+
+
+# ==========================
 # QUEUE PROCESSOR
 # ==========================
 
 def process_queue_loop():
     log("Queue processor started")
+
     while True:
         time.sleep(POLL_INTERVAL_SECONDS)
 
@@ -230,16 +408,39 @@ def process_queue_loop():
         remaining: List[str] = []
 
         for raw in lines:
-            send_p, pri, title, msg = choose_notification(raw)
-            if send_p:
-                ok = send_pushover(title, msg, pri)
-                if ok:
-                    log(f"Sent notification: {title} | {raw}")
-                else:
-                    remaining.append(raw)
-            else:
-                log(f"Rule decided not to send notification: {raw}")
+            ctx = extract_context(raw)
+            rule = get_matching_rule(raw)
 
+            title_t = rule.get("title", "Challenger Event")
+            msg_t = rule.get("message", "{raw}")
+            title = render_template(title_t, ctx)
+            message = render_template(msg_t, ctx)
+            priority = int(rule.get("priority", PUSHOVER_DEFAULT_PRIORITY))
+
+            ok_all = True
+
+            if rule.get("send_pushover", True):
+                if not send_pushover(title, message, priority):
+                    ok_all = False
+
+            if rule.get("send_mqtt", True):
+                if not send_mqtt(ctx, title, message, rule):
+                    ok_all = False
+
+            if rule.get("send_telegram", True):
+                if not send_telegram(title, message):
+                    ok_all = False
+
+            if rule.get("send_homeassistant", True):
+                if not send_homeassistant(ctx, title, message, rule):
+                    ok_all = False
+
+            if ok_all:
+                log(f"Delivered event via rule '{rule.get('name', 'Default')}'")
+            else:
+                remaining.append(raw)
+
+        # Rewrite queue with any events that failed delivery
         with file_lock:
             with open(QUEUE_FILE, "w", encoding="utf-8") as f:
                 for r in remaining:
