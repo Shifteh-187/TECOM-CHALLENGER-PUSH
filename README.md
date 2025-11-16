@@ -11,61 +11,79 @@
                 \/
       ____________________________
      |  🔔  Notification Service  |
-     |  📱  Pushover / Mobile App |
      |____________________________|
 
+Tecom Listener – Multi-Output Event Gateway
+Challenger 10 / 10+ / XR → TCP → Pushover / MQTT / Telegram / Home Assistant
 
-Tecom Listener
-Challenger V8 10 / 10+ / XR → TCP → Local Server → Custom Notifications via Pushover
+A powerful, fully local event listener for Tecom Challenger panels, supporting:
 
-This requires a linux system on the same local network as the TECOM alarm panel ,  The Tecom alarm panel when set correctly in compaths, will send a packet to a printer, we simulate this printer as a python script and intercept the information
-and place it in a que to be used as you wish, as a pushover notification your phone and many other ideas
+🔔 Pushover notifications
 
-A lightweight Python daemon for Tecom Challenger panels that listens for TCP event data (Computer Event Driven / Printer formats) and delivers custom notifications using a rule-based engine.
+📡 MQTT output (Home Assistant compatible)
 
-Supports Pushover, custom regex rules, zone/input naming, and reliable queued delivery.
+💬 Telegram alerts
 
-Perfect for home labs, property monitoring, and replacing UltraSync cloud notifications with something faster, local, and fully customizable.
+📁 Local logging + reliable event queue
 
-This could also be modified to work work with home automation etc
+⚙️ Customizable notification rules (regex-based)
 
-⭐ Features
+🏠 Home Assistant automation via MQTT JSON payloads
 
-Works with all Tecom Ethernet panels (Challenger 10, 10+, XR, V8 with IP module)
+This replaces or augments UltraSync with something faster, local, private, and completely customizable.
 
-Local-only operation — no cloud needed
 
-Custom notifications using regex rules
 
-Queue system ensures no events are lost
+🚀 Features
 
-Pushover support (optional)
+Works with Challenger 10, 10+, XR, V8 (with IP module)
 
-Human-friendly YAML configuration
+Supports Computer Event Driven or Printer formats
 
-Permanent logging
+No cloud required
 
-Systemd service support
+YAML config file for EVERYTHING
 
-Zero coding required for users
+Per-rule selection of outputs (Pushover / MQTT / Telegram)
+
+Home Assistant-friendly MQTT JSON
+
+Reliable delivery queue
+
+Fully open-source Python
+
+Lightweight — runs perfect on Raspberry Pi or Debian server
+
+
 
 📦 Installation
 1. Clone repository
-git clone https://github.com/shifteh-187/tecom-listener.git
-cd tecom-listener
+git clone https://github.com/Shifteth-187/TECOM-CHALLENGER-PUSH.git
+cd TECOM-CHALLENGER-PUSH
 
-2. Install requirements
+2. Install dependencies
 pip3 install -r requirements.txt
 
 3. Create storage directory
+
+The script stores queue + log files here:
+/var/lib/tecom-listener
+
+Create it:
 sudo mkdir -p /var/lib/tecom-listener
 sudo chown $USER:$USER /var/lib/tecom-listener
 
-🛠 Configuration
+
+🛠 Configuration (config.yaml)
 
 All settings live in config.yaml.
-This is the only file normal users will edit.
 
+You can enable/disable any output:
+Pushover
+MQTT
+Telegram
+
+You can also control outputs per rule.
 Example config.yaml
 server:
   listen_host: "0.0.0.0"
@@ -125,6 +143,7 @@ Queue (events waiting for delivery):
 
 /var/lib/tecom-listener/events_queue.txt
 
+
 🔧 Systemd Service (Optional)
 
 Create:
@@ -152,6 +171,45 @@ sudo systemctl daemon-reload
 sudo systemctl enable tecom-listener
 sudo systemctl start tecom-listener
 
+
+
+🏡 Home Assistant Integration (MQTT)
+
+If MQTT output is enabled:
+
+Home Assistant will receive JSON payloads like:
+
+{
+  "title": "GUN SAFE ALARM",
+  "message": "Gun safe triggered!",
+  "raw": "2025-11-16 23:14:55 EVENT 3101 ZONE 003 ALARM",
+  "zone_number": "003",
+  "zone_name": "Gun Safe PIR",
+  "input_number": "",
+  "input_name": "",
+  "timestamp": "2025-11-16 23:14:55"
+}
+
+
+Use HA automations like:
+
+alias: Gun Safe Alarm
+trigger:
+  - platform: mqtt
+    topic: tecom/events
+condition:
+  - condition: template
+    value_template: "{{ trigger.payload_json.zone_number == '003' }}"
+action:
+  - service: notify.mobile_app_yourphone
+    data:
+      title: "Gun Safe Alarm"
+      message: "{{ trigger.payload_json.message }}"
+
+
+
+
+
 🧠 How It Works
 
 The panel sends event lines like:
@@ -173,28 +231,10 @@ Removes successful events from the queue
 
 If sending fails, lines remain queued and retry automatically.
 
-📜 Requirements
 
-requirements.txt:
 
-requests
-PyYAML
 
-🤝 Contributing
 
-PRs welcome!
-
-Ideas:
-
-Add MQTT output
-
-Add Telegram support
-
-Add Webhooks
-
-Add Grafana/InfluxDB export
-
-Build a web dashboard
 
 📜 License
 
