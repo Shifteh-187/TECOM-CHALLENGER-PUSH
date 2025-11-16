@@ -1,5 +1,3 @@
-# config.yaml
-
 server:
   listen_host: "0.0.0.0"
   listen_port: 5000
@@ -8,52 +6,85 @@ server:
 
 pushover:
   enabled: true
-  user_key: "PUT_YOUR_PUSHOVER_USER_KEY_HERE"
-  api_token: "PUT_YOUR_PUSHOVER_APP_TOKEN_HERE"
+  user_key: "YOUR_PUSHOVER_USER_KEY"
+  api_token: "YOUR_PUSHOVER_API_TOKEN"
   default_priority: 0
 
-# Map zones to friendly names
+mqtt:
+  enabled: false
+  host: "localhost"
+  port: 1883
+  username: ""
+  password: ""
+  client_id: "tecom-listener"
+  topic: "tecom/events"          # can be overridden per rule with mqtt_topic
+
+telegram:
+  enabled: false
+  bot_token: ""                  # e.g. 123456:ABC-DEF...
+  chat_id: ""                    # numeric chat id or @channelusername
+
+homeassistant:
+  enabled: false
+  base_url: "http://homeassistant.local:8123"
+  long_lived_token: ""           # HA long-lived access token
+  event_name: "tecom_event"      # default event name; can override per rule with ha_event
+
 zones:
   "001": "Front Door PIR"
   "002": "Lounge PIR"
   "003": "Gun Safe PIR"
 
-# Map inputs to friendly names
 inputs:
-  "005": "Safe Reed Switch"
-  "006": "Garage Roller Door"
+  "005": "Safe Reed"
+  "006": "Garage Door"
 
 # Notification rules
-# First matching rule wins.
+# - First rule whose regex matches is used
+# - Per-rule toggles: send_pushover / send_mqtt / send_telegram / send_homeassistant
+# - Templates can use {raw}, {zone_number}, {zone_name}, {input_number}, {input_name}
+
 notifications:
-  # Example: high-priority on gun safe alarm
-  - name: "Gun safe alarm"
+  - name: "Gun Safe Alarm"
     match_regex: "ZONE\\s+003.*ALARM"
-    send_pushover: true
     priority: 1
+    send_pushover: true
+    send_mqtt: true
+    send_telegram: false
+    send_homeassistant: true
+    mqtt_topic: "tecom/gunsafe"
+    ha_event: "tecom_gunsafe_alarm"
     title: "GUN SAFE ALARM"
-    message: "Gun safe zone ({zone_number} - {zone_name}) is IN ALARM.\nRaw: {raw}"
+    message: "Gun safe triggered! Zone {zone_number} ({zone_name})\n{raw}"
 
-  # Example: any alarm on any zone
-  - name: "General zone alarm"
+  - name: "Any Zone Alarm"
     match_regex: "ZONE\\s+(\\d+).*ALARM"
-    send_pushover: true
     priority: 0
-    title: "Alarm on Zone {zone_number} - {zone_name}"
-    message: "Zone {zone_number} ({zone_name}) reported ALARM.\nEvent: {raw}"
+    send_pushover: true
+    send_mqtt: true
+    send_telegram: true
+    send_homeassistant: true
+    mqtt_topic: "tecom/zone/{zone_number}"
+    ha_event: "tecom_zone_alarm"
+    title: "Zone {zone_number} ({zone_name}) ALARM"
+    message: "{raw}"
 
-  # Example: input open/restore
-  - name: "Input event"
+  - name: "Input Events"
     match_regex: "INPUT\\s+(\\d+)"
-    send_pushover: true
-    priority: 0
-    title: "Input {input_number} - {input_name}"
-    message: "Input {input_number} ({input_name}) changed state.\nEvent: {raw}"
+    send_pushover: false
+    send_mqtt: true
+    send_telegram: false
+    send_homeassistant: true
+    mqtt_topic: "tecom/input/{input_number}"
+    ha_event: "tecom_input_event"
+    title: "Input {input_number} ({input_name})"
+    message: "{raw}"
 
-  # Fallback default – catch anything else
   - name: "Default"
     match_regex: ".*"
     send_pushover: true
-    priority: 0
+    send_mqtt: true
+    send_telegram: true
+    send_homeassistant: true
     title: "Challenger Event"
     message: "{raw}"
