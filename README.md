@@ -1,3 +1,5 @@
+This python script and its assosiated files are not offical TECOM/aritech software, it is created by a member of the security community. 
+	 
 	 Tecom / Challenger Panel
                 ||
                 ||  events / alarms 
